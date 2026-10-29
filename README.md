@@ -1,8 +1,8 @@
 # ferrous-agent
 
-[← Back to FerrousCX Root Architecture](https://github.com/reidlai/ferrouscx-bmad)
+[← Back to FerrousCX Root Architecture](https://github.com/reidlai/ferrous-cx)
 
-[![Component Type: Agentic AI Core](https://img.shields.io/badge/component-Agentic%20AI%20Core-blue.svg)](https://github.com/reidlai/ferrouscx-bmad)
+[![Component Type: Agentic AI Core](https://img.shields.io/badge/component-Agentic%20AI%20Core-blue.svg)](https://github.com/reidlai/ferrous-cx)
 [![Framework: rig-core](https://img.shields.io/badge/framework-rig--core%20(Pure%20Rust)-orange.svg)](https://github.com/0xPlaygrounds/rig)
 [![Provider: Pluggable Multi-Model](https://img.shields.io/badge/LLMs-Multi--Provider%20(Ollama%20%7C%20HF%20%7C%20Claude%20%7C%20OpenAI)-purple.svg)](#-pluggable-multi-provider-llm-engine)
 [![Gatekeeper: context-sanitizer](https://img.shields.io/badge/security-context--sanitizer%20(DLP%20%2B%20Ingress)-brightgreen.svg)](#-context-sanitizer-gatekeeper)
