@@ -20,9 +20,9 @@ This submodule establishes:
    - **Ingress Firewall:** Blocks direct and indirect prompt injection, jailbreaks, and system prompt exfiltration across all models.
    - **Egress DLP:** Redacts and pseudonymizes sensitive PII (Brazilian CPF, credit cards, emails, phone numbers) before prompts leave the local process for external or local LLM inference.
 3. **Modular Skills & `ferrous-api` Invocation Tools:**  
-   Houses specialized agent skills (`order-investigation`, `courtesy-credit`, `carrier-escalation`, `replay-control`) and strongly typed `rig::tool::Tool` client implementations that directly call the REST, query, and command endpoints defined in **`ferrous-api`**.
+   Houses specialized agent skills (`order-investigation`, `courtesy-credit`, `carrier-escalation`) and strongly typed `rig::tool::Tool` client implementations that directly call the REST, query, and command endpoints defined in **`ferrous-api`**.
 4. **Structural Human-in-the-Loop (HITL) Safety:**  
-   The agent is strictly non-autonomous regarding financial or state mutations. It produces structured proposal cards (`HitlProposalCard`) that require physical human click approval in the UI, which then triggers the authorized mutation in `ferrous-api`.
+   The agent is strictly non-autonomous regarding financial or state mutations. It produces structured proposal cards (`HitlProposalCard`) that require physical human click approval in the UI, which then triggers the authorized mutation in `ferrous-api`. The agent never controls the replayer: replay is observed only as read-only telemetry in the UI.
 5. **Native In-Process LLM Benchmark Suite (`src/benchmark/`):**  
    An asynchronous evaluation harness measuring microsecond Time-To-First-Token (TTFT), Inter-Token Latency (ITL) jitter, and TPS via `tokio::time::Instant`, streaming live telemetry over Axum SSE, and persisting Arrow `RecordBatch` runs to Delta Lake (`delta/llm_benchmarks/`) for sub-3ms DataFusion SQL comparison queries.
 6. **OpenTelemetry GenAI Semantic Conventions:**  
@@ -172,7 +172,6 @@ flowchart TD
 | **`skills/order-investigation/`** | `GET /api/v1/orders/{order_id}`<br/>`GET /api/v1/orders/{order_id}/tracking` | Multi-step investigation diagnosing order status, shipment milestones, carrier delay duration, and customer history. |
 | **`skills/courtesy-credit/`** | `POST /api/v1/commands/orders/issue-credit` | Evaluates delay criteria against `cx_policy_knowledge` SOPs, checks Carlos/Elena's credit limit in Kanidm, and formats `HitlProposalCard`. |
 | **`skills/carrier-escalation/`** | `POST /api/v1/commands/disputes/escalate` | Detects carrier SLA breach patterns (e.g. Correios SEDEX > 4 days) and files formal carrier dispute tickets. |
-| **`skills/replay-control/`** | `POST /api/v1/replay/start`<br/>`POST /api/v1/replay/pause` | Controls simulation speed (1x, 10x, 50x) and replayer profiles via `ferrous-api` control routes. |
 
 ### 2. `rig::tool::Tool` Implementation Calling `ferrous-api`
 
@@ -232,9 +231,9 @@ In compliance with **AD-22 (FR-28 / NFR-14)**, `ferrous-agent` embeds an in-proc
 ### Benchmark Architecture & Metrics
 1. **Microsecond Latency Instrumentation:** Measures Time-To-First-Token (TTFT), Inter-Token Latency (ITL) jitter, and Tokens Per Second (TPS) via `tokio::time::Instant` and `rig-core` `stream_prompt()`.
 2. **Contract-First Tool Calling Validation:** Validates arguments against production Rust tool traits (`ApiGetOrderTool`, `ApiSubmitCreditCommandTool`) using `schemars` and pure-Rust `jsonschema` in sub-millisecond time.
-3. **Domain Guardrail Assertions:** Validates business invariants (AD-17 $20 credit limit ceiling) and asserts PII masking via `context-sanitizer`.
+3. **Domain Guardrail Assertions:** Validates business invariants ($20 credit limit ceiling) and asserts PII masking via `context-sanitizer`.
 4. **SSE Telemetry Streaming:** Broadcasts real-time chunk streams over `GET /api/v1/benchmarks/:run_id/stream` to the Svelte 5 Copilot Benchmarking Studio.
-5. **Delta Lake & Arrow Lakehouse Persistence:** Batches benchmark records as Apache Arrow `RecordBatch` tables and appends them atomically to `delta/llm_benchmarks/` with ACID transaction logs via `delta-lake-rs`.
+5. **Delta Lake & Arrow Lakehouse Persistence:** Batches benchmark records as Apache Arrow `RecordBatch` tables and appends them atomically to `delta/llm_benchmarks/` with ACID transaction logs via the `deltalake` crate.
 6. **Sub-3ms DataFusion SQL Comparisons:** Enables immediate analytical SQL queries across historical benchmark runs:
    ```sql
    SELECT model_id, provider,
@@ -255,12 +254,11 @@ ferrous-agent/
 ├── .github/workflows/
 │   └── devsecops-ci.yml        # Tier 1 Rust CI (clippy, cargo-audit, test)
 ├── .pre-commit-config.yaml      # Pre-commit hooks (cargo fmt, gitleaks)
-├── Cargo.toml                   # rig-core, reqwest, qdrant-client, arrow, delta-lake-rs
+├── Cargo.toml                   # rig-core, reqwest, qdrant-client, arrow, deltalake
 ├── skills/                      # Declarative Agent Skills & Runbooks
 │   ├── order-investigation/     # Multi-step order diagnosis workflow
 │   ├── courtesy-credit/         # Credit proposal & policy verification
-│   ├── carrier-escalation/      # Carrier SLA breach dispute workflow
-│   └── replay-control/          # Simulation control orchestration
+│   └── carrier-escalation/      # Carrier SLA breach dispute workflow
 ├── scripts/
 │   ├── test-api-tools.sh        # Standalone verification script calling ferrous-api
 │   └── seed-agent-test.py       # Mock environment test harness
