@@ -29,6 +29,12 @@ regex = "1.11"
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+arrow = "60.1"
+parquet = { version = "60.1", features = ["arrow"] }
+jsonschema = { version = "0.61", default-features = false }
+axum = "0.7"
+clap = { version = "4.5", features = ["derive", "env"] }
+chrono = { version = "0.4", features = ["serde"] }
 
 [profile.release]
 opt-level = "z"
