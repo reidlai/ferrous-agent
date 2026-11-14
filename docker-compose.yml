@@ -1,0 +1,42 @@
+services:
+  ferrous-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ferrous-agent:latest
+    container_name: ferrous-agent
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:noexec,nosuid,nodev,size=64M
+      - /delta:noexec,nosuid,nodev,size=128M
+    ports:
+      - "${PORT:-8081}:${PORT:-8081}"
+    environment:
+      PORT: "${PORT:-8081}"
+      RUST_LOG: "${RUST_LOG:-info}"
+      LLM_PROVIDER: "${LLM_PROVIDER:-ollama}"
+      LLM_MODEL: "${LLM_MODEL:-qwen2.5:7b}"
+      LLM_API_BASE: "${LLM_API_BASE:-}"
+      LLM_API_KEY: "${LLM_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      GROQ_API_KEY: "${GROQ_API_KEY:-}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      HF_TOKEN: "${HF_TOKEN:-}"
+      QDRANT_URL: "${QDRANT_URL:-}"
+      FERROUS_API_URL: "${FERROUS_API_URL:-}"
+      FERROUS_AUTH_TOKEN: "${FERROUS_AUTH_TOKEN:-}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-}"
+    healthcheck:
+      test: ["/ferrous-agent", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
