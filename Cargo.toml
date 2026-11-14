@@ -1,0 +1,34 @@
+[package]
+name = "ferrous-agent"
+version = "0.1.0"
+edition = "2021"
+authors = ["FerrousCX Contributors"]
+description = "Pure-Rust Pluggable Multi-Provider LLM Orchestration Engine via rig-core"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "ferrous_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ferrous-agent"
+path = "src/main.rs"
+
+[dependencies]
+rig-core = { version = "0.46", features = ["reqwest"] }
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
