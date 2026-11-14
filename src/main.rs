@@ -11,6 +11,7 @@ use ferrous_agent::benchmark::{
     BenchmarkSuite, DryRunDispatch, DEFAULT_DELTA_DIR,
 };
 use ferrous_agent::config::AgentConfig;
+use ferrous_agent::server::{probe_health, service_router, HealthState};
 use ferrous_agent::telemetry;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -26,6 +27,10 @@ struct Cli {
     #[arg(long)]
     check_config: bool,
 
+    /// Probe the local `/health` endpoint and exit 0 if healthy, 1 otherwise.
+    #[arg(long)]
+    healthcheck: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -34,6 +39,30 @@ struct Cli {
 enum Commands {
     /// Run the native in-process LLM benchmark suite.
     Benchmark(BenchmarkArgs),
+    /// Run the HTTP service exposing `/health` and benchmark SSE streams.
+    Serve(ServeArgs),
+}
+
+#[derive(Debug, Args)]
+struct ServeArgs {
+    /// Port to listen on when `--bind` is not specified.
+    #[arg(long, env = "PORT", default_value_t = 8081, value_parser = parse_port_env)]
+    port: u16,
+
+    /// Optional socket address overriding `0.0.0.0:<port>`.
+    #[arg(long)]
+    bind: Option<SocketAddr>,
+}
+
+fn parse_port_env(raw: &str) -> Result<u16, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        Ok(8081)
+    } else {
+        trimmed
+            .parse::<u16>()
+            .map_err(|err| format!("Invalid PORT value '{raw}': {err}"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -66,9 +95,10 @@ struct BenchmarkArgs {
 }
 
 fn main() -> ExitCode {
-    let _telemetry_guard = telemetry::init_telemetry();
-
     let cli = Cli::parse();
+
+    // Skip OTLP exporter initialization during short-lived `--healthcheck` probes.
+    let _telemetry_guard = (!cli.healthcheck).then(telemetry::init_telemetry);
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -82,11 +112,101 @@ fn main() -> ExitCode {
     };
 
     runtime.block_on(async move {
+        if cli.healthcheck {
+            return run_healthcheck_cli().await;
+        }
         match cli.command {
             Some(Commands::Benchmark(args)) => run_benchmark_cli(args).await,
+            Some(Commands::Serve(args)) => run_serve_cli(args).await,
             None => run_agent_init(cli.check_config),
         }
     })
+}
+
+async fn run_healthcheck_cli() -> ExitCode {
+    let port: u16 = match std::env::var("PORT") {
+        Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse() {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!("Invalid PORT value '{raw}': {err}");
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => 8081,
+    };
+    let url = format!("http://127.0.0.1:{port}/health");
+    match probe_health(&url).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_serve_cli(args: ServeArgs) -> ExitCode {
+    let addr = args
+        .bind
+        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], args.port)));
+
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(err) => {
+            tracing::error!(bind_addr = %addr, error = %err, "failed to bind HTTP service listener");
+            eprintln!("Failed to bind HTTP service on {addr}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let bound_addr = listener.local_addr().unwrap_or(addr);
+
+    let health_state = HealthState::from_env();
+    let sse_hub = BenchmarkSseHub::new();
+    let router = service_router(health_state.clone(), sse_hub);
+
+    tracing::info!(
+        bind_addr = %bound_addr,
+        "ferrous-agent HTTP service listening"
+    );
+
+    if let Err(err) = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            health_state.set_ready(false);
+        })
+        .await
+    {
+        tracing::error!(error = %err, "ferrous-agent HTTP service exited with error");
+        eprintln!("HTTP service error: {err}");
+        return ExitCode::FAILURE;
+    }
+
+    ExitCode::SUCCESS
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+    tracing::info!("shutdown signal received, draining connections");
 }
 
 fn run_agent_init(check_config_only: bool) -> ExitCode {

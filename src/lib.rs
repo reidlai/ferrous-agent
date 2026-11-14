@@ -4,6 +4,7 @@ pub mod client;
 pub mod config;
 pub mod models;
 pub mod sanitizer;
+pub mod server;
 pub mod skills;
 pub mod telemetry;
 pub mod tools;

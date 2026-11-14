@@ -1,0 +1,13 @@
+target/
+.git/
+.github/
+.gitignore
+.pre-commit-config.yaml
+Dockerfile
+.dockerignore
+docker-compose.yml
+scripts/
+tests/
+README.md
+deny.toml
+*.log

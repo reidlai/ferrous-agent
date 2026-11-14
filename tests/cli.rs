@@ -168,3 +168,170 @@ fn benchmark_suite_tools_dry_run_json_outputs_valid_report() {
         .and_then(|v| v.as_array())
         .is_some_and(|arr| !arr.is_empty()));
 }
+
+#[test]
+fn healthcheck_succeeds_against_live_local_health_endpoint() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    let (port, shutdown_tx, server_handle) = rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local_addr").port();
+        let app = ferrous_agent::server::service_router(
+            ferrous_agent::server::HealthState::new(true, None),
+            ferrous_agent::benchmark::BenchmarkSseHub::new(),
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        (port, tx, handle)
+    });
+
+    let runtime_thread = std::thread::spawn(move || {
+        rt.block_on(async move {
+            let _ = server_handle.await;
+        });
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ferrous-agent"))
+        .arg("--healthcheck")
+        .env("PORT", port.to_string())
+        .output()
+        .expect("failed to execute ferrous-agent --healthcheck");
+
+    let _ = shutdown_tx.send(());
+    let _ = runtime_thread.join();
+
+    assert!(
+        output.status.success(),
+        "expected exit 0 for --healthcheck against live /health, got {:?}, stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn healthcheck_fails_when_port_is_unreachable() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let closed_port = listener.local_addr().expect("local_addr").port();
+    drop(listener);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ferrous-agent"))
+        .arg("--healthcheck")
+        .env("PORT", closed_port.to_string())
+        .output()
+        .expect("failed to execute ferrous-agent --healthcheck");
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit for --healthcheck on unreachable port {closed_port}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("healthcheck"),
+        "expected healthcheck failure message on stderr, got: {stderr:?}"
+    );
+}
+
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn serve_process_responds_to_healthcheck_and_exits_cleanly() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let port = listener.local_addr().expect("local_addr").port();
+    drop(listener);
+
+    let child = Command::new(env!("CARGO_BIN_EXE_ferrous-agent"))
+        .args(["serve", "--bind", &format!("127.0.0.1:{port}")])
+        .env_remove("QDRANT_URL")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn ferrous-agent serve");
+    let mut guard = ChildGuard(child);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+        .expect("build reqwest client");
+    let health_url = format!("http://127.0.0.1:{port}/health");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut ready = false;
+    while std::time::Instant::now() < deadline {
+        if let Some(status) = guard.0.try_wait().expect("poll child status") {
+            panic!("ferrous-agent serve exited prematurely with {status}");
+        }
+        let ok = rt.block_on(async {
+            matches!(
+                client.get(&health_url).send().await,
+                Ok(resp) if resp.status() == reqwest::StatusCode::OK
+            )
+        });
+        if ok {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        ready,
+        "timed out waiting for GET {health_url} to return 200 OK"
+    );
+
+    let hc_output = Command::new(env!("CARGO_BIN_EXE_ferrous-agent"))
+        .arg("--healthcheck")
+        .env("PORT", port.to_string())
+        .output()
+        .expect("execute ferrous-agent --healthcheck");
+
+    assert!(
+        hc_output.status.success(),
+        "expected exit 0 for --healthcheck against spawned serve, got {:?}, stderr: {}",
+        hc_output.status.code(),
+        String::from_utf8_lossy(&hc_output.stderr)
+    );
+
+    guard.0.kill().expect("terminate ferrous-agent serve");
+    let _ = guard.0.wait().expect("wait for ferrous-agent serve");
+}
+
+#[test]
+fn healthcheck_invalid_port_env_exits_non_zero() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ferrous-agent"))
+        .arg("--healthcheck")
+        .env("PORT", "notaport")
+        .output()
+        .expect("execute ferrous-agent --healthcheck");
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit for PORT=notaport --healthcheck"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Invalid PORT value"),
+        "expected 'Invalid PORT value' on stderr, got: {stderr:?}"
+    );
+}
