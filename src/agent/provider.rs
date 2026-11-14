@@ -1,13 +1,16 @@
 use async_trait::async_trait;
-use rig_core::completion::CompletionRequest;
+use rig_core::completion::{CompletionRequest, ToolDefinition};
 use rig_core::driver::DynModel;
 use rig_core::operation::Completion;
 use rig_core::providers::{anthropic, gemini, ollama, openai};
+use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::streaming::{adapt_rig_stream, BoxedChunkStream, StreamChunk};
 use crate::agent::AgentError;
 use crate::config::{AgentConfig, ProviderKind};
+use crate::models::StructuredExtractor;
 
 /// Provider-agnostic completion and streaming dispatch interface.
 #[async_trait]
@@ -25,6 +28,17 @@ pub trait CompletionDispatch: Send + Sync {
         prompt: &str,
         cancel: CancellationToken,
     ) -> Result<String, AgentError>;
+
+    /// Execute a unary completion prompt with registered tool definitions, respecting `cancel`.
+    async fn prompt_with_tools(
+        &self,
+        system_preamble: Option<&str>,
+        prompt: &str,
+        _tools: &[ToolDefinition],
+        cancel: CancellationToken,
+    ) -> Result<String, AgentError> {
+        self.prompt(system_preamble, prompt, cancel).await
+    }
 
     /// Execute a streaming completion prompt, respecting `cancel`.
     async fn stream_prompt(
@@ -68,6 +82,14 @@ impl LlmClient {
     pub fn rig_model(&self) -> &DynModel<Completion> {
         &self.model
     }
+
+    /// Construct a [`StructuredExtractor<T>`] backed by this client's completion model.
+    pub fn extractor<T>(&self) -> StructuredExtractor<T>
+    where
+        T: DeserializeOwned + JsonSchema,
+    {
+        StructuredExtractor::new(self.model.clone())
+    }
 }
 
 #[async_trait]
@@ -86,6 +108,17 @@ impl CompletionDispatch for LlmClient {
         prompt: &str,
         cancel: CancellationToken,
     ) -> Result<String, AgentError> {
+        self.prompt_with_tools(system_preamble, prompt, &[], cancel)
+            .await
+    }
+
+    async fn prompt_with_tools(
+        &self,
+        system_preamble: Option<&str>,
+        prompt: &str,
+        tools: &[ToolDefinition],
+        cancel: CancellationToken,
+    ) -> Result<String, AgentError> {
         if prompt.trim().is_empty() {
             return Err(AgentError::Stream("prompt must not be empty".to_string()));
         }
@@ -93,7 +126,7 @@ impl CompletionDispatch for LlmClient {
             return Err(AgentError::Stream("prompt cancelled".to_string()));
         }
 
-        let request = build_request(system_preamble, prompt);
+        let request = build_request_with_tools(system_preamble, prompt, tools);
         let fut = self.model.call(request);
 
         tokio::select! {
@@ -130,9 +163,20 @@ impl CompletionDispatch for LlmClient {
 }
 
 fn build_request(system_preamble: Option<&str>, prompt: &str) -> CompletionRequest {
+    build_request_with_tools(system_preamble, prompt, &[])
+}
+
+fn build_request_with_tools(
+    system_preamble: Option<&str>,
+    prompt: &str,
+    tools: &[ToolDefinition],
+) -> CompletionRequest {
     let mut req = CompletionRequest::new(prompt);
     if let Some(preamble) = system_preamble.filter(|p| !p.trim().is_empty()) {
         req = req.preamble(preamble);
+    }
+    if !tools.is_empty() {
+        req = req.tools(tools.iter().cloned());
     }
     req
 }

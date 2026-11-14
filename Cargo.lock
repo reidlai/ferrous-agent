@@ -323,7 +323,9 @@ dependencies = [
  "async-trait",
  "futures",
  "regex",
+ "reqwest",
  "rig-core",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror",
@@ -331,6 +333,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

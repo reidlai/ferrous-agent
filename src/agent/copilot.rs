@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use rig_core::completion::ToolDefinition;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::provider::{CompletionDispatch, LlmClient};
@@ -7,11 +8,14 @@ use crate::agent::streaming::BoxedChunkStream;
 use crate::agent::AgentError;
 use crate::config::{AgentConfig, ProviderKind};
 use crate::sanitizer::{ContextSanitizer, DeAnonymizer};
+use crate::skills::SkillRegistry;
+use crate::tools::FerrousToolSuite;
 
-/// Builder for [`CopilotAgent`] with system preamble configuration.
+/// Builder for [`CopilotAgent`] with system preamble, skill, and tool configuration.
 pub struct CopilotAgentBuilder {
     dispatch: Arc<dyn CompletionDispatch>,
     preamble: Option<String>,
+    tools: Vec<ToolDefinition>,
 }
 
 impl CopilotAgentBuilder {
@@ -22,11 +26,34 @@ impl CopilotAgentBuilder {
         self
     }
 
+    /// Compose selected skills from `registry` into the system preamble.
+    pub fn with_skills(mut self, registry: &SkillRegistry, skill_names: &[&str]) -> Self {
+        let composed = registry.compose_preamble(self.preamble.as_deref(), skill_names);
+        self.preamble = (!composed.trim().is_empty()).then_some(composed);
+        self
+    }
+
+    /// Register all 5 `ferrous-api` & Qdrant tools from [`FerrousToolSuite`], deduplicated by name.
+    pub fn with_tool_suite(self, suite: &FerrousToolSuite) -> Self {
+        self.tools(suite.definitions())
+    }
+
+    /// Register custom `rig_core::completion::ToolDefinition`s, deduplicating by tool name.
+    pub fn tools(mut self, defs: impl IntoIterator<Item = ToolDefinition>) -> Self {
+        for def in defs {
+            if !self.tools.iter().any(|existing| existing.name == def.name) {
+                self.tools.push(def);
+            }
+        }
+        self
+    }
+
     /// Finalize and construct the [`CopilotAgent`].
     pub fn build(self) -> CopilotAgent {
         CopilotAgent {
             dispatch: self.dispatch,
             preamble: self.preamble,
+            tools: self.tools,
             sanitizer: ContextSanitizer::new(),
         }
     }
@@ -37,6 +64,7 @@ impl CopilotAgentBuilder {
 pub struct CopilotAgent {
     dispatch: Arc<dyn CompletionDispatch>,
     preamble: Option<String>,
+    tools: Vec<ToolDefinition>,
     sanitizer: ContextSanitizer,
 }
 
@@ -51,6 +79,7 @@ impl CopilotAgent {
         CopilotAgentBuilder {
             dispatch,
             preamble: None,
+            tools: Vec::new(),
         }
     }
 
@@ -75,6 +104,11 @@ impl CopilotAgent {
         self.preamble.as_deref()
     }
 
+    /// Registered `rig-core` tool definitions.
+    pub fn tool_definitions(&self) -> &[ToolDefinition] {
+        &self.tools
+    }
+
     /// Sanitize a prompt via [`ContextSanitizer`] without dispatching it.
     pub fn sanitize_prompt(&self, prompt: &str) -> Result<(String, DeAnonymizer), AgentError> {
         Ok(self.sanitizer.sanitize_for_llm(prompt)?)
@@ -88,10 +122,20 @@ impl CopilotAgent {
         cancel: CancellationToken,
     ) -> Result<String, AgentError> {
         let (sanitized_prompt, de_anonymizer) = self.sanitizer.sanitize_for_llm(prompt)?;
-        let reply = self
-            .dispatch
-            .prompt(self.preamble.as_deref(), &sanitized_prompt, cancel)
-            .await?;
+        let reply = if self.tools.is_empty() {
+            self.dispatch
+                .prompt(self.preamble.as_deref(), &sanitized_prompt, cancel)
+                .await?
+        } else {
+            self.dispatch
+                .prompt_with_tools(
+                    self.preamble.as_deref(),
+                    &sanitized_prompt,
+                    &self.tools,
+                    cancel,
+                )
+                .await?
+        };
         Ok(de_anonymizer.restore(&reply))
     }
 
@@ -122,6 +166,7 @@ mod tests {
     struct MockDispatch {
         recorded_preamble: Mutex<Option<String>>,
         recorded_prompt: Mutex<Option<String>>,
+        recorded_tools: Mutex<Vec<String>>,
         pending_mode: bool,
     }
 
@@ -130,6 +175,7 @@ mod tests {
             Self {
                 recorded_preamble: Mutex::new(None),
                 recorded_prompt: Mutex::new(None),
+                recorded_tools: Mutex::new(Vec::new()),
                 pending_mode,
             }
         }
@@ -157,6 +203,18 @@ mod tests {
                 return Err(AgentError::Stream("cancelled".to_string()));
             }
             Ok(format!("echo:{prompt}"))
+        }
+
+        async fn prompt_with_tools(
+            &self,
+            system_preamble: Option<&str>,
+            prompt: &str,
+            tools: &[ToolDefinition],
+            cancel: CancellationToken,
+        ) -> Result<String, AgentError> {
+            *self.recorded_tools.lock().unwrap() =
+                tools.iter().map(|t| t.name.to_string()).collect();
+            self.prompt(system_preamble, prompt, cancel).await
         }
 
         async fn stream_prompt(
@@ -343,5 +401,43 @@ mod tests {
             .expect("stream_prompt should sanitize and dispatch");
         let stream_dispatched = mock.recorded_prompt.lock().unwrap().clone().unwrap();
         assert!(!stream_dispatched.contains("123.456.789-09"));
+    }
+
+    #[tokio::test]
+    async fn copilot_registers_skills_and_tool_suite() {
+        let mock = Arc::new(MockDispatch::new(false));
+        let registry = SkillRegistry::builtin();
+        let client = Arc::new(crate::client::FerrousApiClient::new(
+            "http://localhost:8080",
+            "tok",
+        ));
+        let suite = FerrousToolSuite::new(client);
+
+        let agent = CopilotAgent::builder_with_dispatch(mock.clone())
+            .preamble("Base preamble.")
+            .with_skills(
+                &registry,
+                &[
+                    "order-investigation",
+                    "courtesy-credit",
+                    "order-investigation",
+                ],
+            )
+            .with_tool_suite(&suite)
+            .with_tool_suite(&suite)
+            .build();
+
+        let preamble = agent.preamble().expect("preamble should be composed");
+        assert!(preamble.contains("Base preamble."));
+        assert_eq!(preamble.matches("## Skill: order-investigation").count(), 1);
+        assert!(preamble.contains("## Skill: courtesy-credit"));
+        assert_eq!(agent.tool_definitions().len(), 5);
+
+        let reply = agent
+            .prompt("Check ORD-1001", CancellationToken::new())
+            .await
+            .expect("prompt with tools should succeed");
+        assert_eq!(reply, "echo:Check ORD-1001");
+        assert_eq!(mock.recorded_tools.lock().unwrap().len(), 5);
     }
 }

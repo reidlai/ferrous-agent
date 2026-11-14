@@ -16,6 +16,9 @@ path = "src/main.rs"
 
 [dependencies]
 rig-core = { version = "0.46", features = ["reqwest"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+schemars = "1.2"
+uuid = { version = "1.10", features = ["v7", "serde"] }
 tokio = { version = "1.40", features = ["full"] }
 tokio-util = "0.7"
 futures = "0.3"
