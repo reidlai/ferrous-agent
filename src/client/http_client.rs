@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use crate::config::SecretString;
 use crate::models::{OrderDetails, RagHit, RagSearchResponse, TrackingDetails};
+use crate::telemetry::inject_w3c_trace_context;
 
 /// Default Qdrant embedding vector dimension when a text-only query is issued without a caller vector.
 const DEFAULT_FALLBACK_VECTOR_DIM: usize = 8;
@@ -186,7 +187,9 @@ impl FerrousApiClient {
             filter: QdrantTextFilter { query_text },
         };
 
-        let mut req = self.http.post(&url).json(&body);
+        let mut trace_headers = reqwest::header::HeaderMap::new();
+        inject_w3c_trace_context(&mut trace_headers);
+        let mut req = self.http.post(&url).headers(trace_headers).json(&body);
         if !self.auth_token.expose().is_empty() {
             req = req.bearer_auth(self.auth_token.expose());
         }
@@ -201,7 +204,9 @@ impl FerrousApiClient {
         url: &str,
         endpoint: &str,
     ) -> Result<T, ClientError> {
-        let mut req = self.http.get(url);
+        let mut trace_headers = reqwest::header::HeaderMap::new();
+        inject_w3c_trace_context(&mut trace_headers);
+        let mut req = self.http.get(url).headers(trace_headers);
         if !self.auth_token.expose().is_empty() {
             req = req.bearer_auth(self.auth_token.expose());
         }

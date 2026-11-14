@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use async_trait::async_trait;
 use rig_core::completion::{CompletionRequest, ToolDefinition};
 use rig_core::driver::DynModel;
@@ -6,11 +8,15 @@ use rig_core::providers::{anthropic, gemini, ollama, openai};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::agent::streaming::{adapt_rig_stream, BoxedChunkStream, StreamChunk};
 use crate::agent::AgentError;
 use crate::config::{AgentConfig, ProviderKind};
 use crate::models::StructuredExtractor;
+use crate::telemetry::{
+    estimate_token_count, genai_chat_span, instrument_chunk_stream, record_completion_tokens,
+};
 
 /// Provider-agnostic completion and streaming dispatch interface.
 #[async_trait]
@@ -126,17 +132,28 @@ impl CompletionDispatch for LlmClient {
             return Err(AgentError::Stream("prompt cancelled".to_string()));
         }
 
+        let span = genai_chat_span(self.provider.as_str(), &self.model_name, "chat");
         let request = build_request_with_tools(system_preamble, prompt, tools);
-        let fut = self.model.call(request);
+        let fut = self.model.call(request).instrument(span.clone());
 
         tokio::select! {
             biased;
             () = cancel.cancelled() => {
+                span.record("otel.status_code", "ERROR");
                 Err(AgentError::Stream("prompt cancelled".to_string()))
             }
             res = fut => {
-                let response = res?;
-                Ok(response.text())
+                match res {
+                    Ok(response) => {
+                        let text = response.text();
+                        record_completion_tokens(&span, estimate_token_count(&text));
+                        Ok(text)
+                    }
+                    Err(err) => {
+                        span.record("otel.status_code", "ERROR");
+                        Err(err.into())
+                    }
+                }
             }
         }
     }
@@ -156,9 +173,21 @@ impl CompletionDispatch for LlmClient {
             })));
         }
 
+        let span = genai_chat_span(self.provider.as_str(), &self.model_name, "stream");
+        let started_at = Instant::now();
         let request = build_request(system_preamble, prompt);
-        let stream = self.model.stream(request)?;
-        Ok(adapt_rig_stream(stream, cancel))
+        let stream = {
+            let _entered = span.enter();
+            match self.model.stream(request) {
+                Ok(s) => s,
+                Err(err) => {
+                    span.record("otel.status_code", "ERROR");
+                    return Err(err.into());
+                }
+            }
+        };
+        let adapted = adapt_rig_stream(stream, cancel);
+        Ok(instrument_chunk_stream(adapted, span, started_at))
     }
 }
 
@@ -408,5 +437,179 @@ mod tests {
                 Err(AgentError::Stream(ref msg)) if msg == "prompt must not be empty"
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn llm_client_prompt_and_stream_emit_genai_chat_spans_against_mock_http() {
+        use axum::http::header::CONTENT_TYPE;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use futures::StreamExt;
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry::Value;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use serde_json::json;
+        use tokio::net::TcpListener;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        use crate::telemetry::{
+            GEN_AI_OPERATION_NAME, GEN_AI_PROVIDER_NAME, GEN_AI_REQUEST_MODEL,
+            GEN_AI_RESPONSE_COMPLETION_TOKENS, GEN_AI_SERVER_TTFT_US, GEN_AI_SYSTEM,
+        };
+
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                let is_stream = body
+                    .get("stream")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if is_stream {
+                    let sse = concat!(
+                        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello \"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"stream!\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    );
+                    ([(CONTENT_TYPE, "text/event-stream")], sse).into_response()
+                } else {
+                    Json(json!({
+                        "id": "chatcmpl-1",
+                        "object": "chat.completion",
+                        "created": 1700000000,
+                        "model": "gpt-4o-mini",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "Hello from mock OpenAI"
+                            },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 5,
+                            "completion_tokens": 4,
+                            "total_tokens": 9
+                        }
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let cfg = AgentConfig::from_map(&map(&[
+            ("LLM_PROVIDER", "openai"),
+            ("LLM_MODEL", "gpt-4o-mini"),
+            ("OPENAI_API_KEY", "sk-test"),
+            ("LLM_API_BASE", &format!("http://{addr}/v1")),
+        ]))
+        .expect("openai config with mock base");
+        let client = LlmClient::from_config(&cfg).expect("LlmClient should construct");
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("ferrous-agent-provider-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let _default_guard = tracing::subscriber::set_default(subscriber);
+
+        let reply = client
+            .prompt(Some("Be concise."), "hi", CancellationToken::new())
+            .await
+            .expect("mock prompt should succeed");
+        assert_eq!(reply, "Hello from mock OpenAI");
+
+        let chunks: Vec<StreamChunk> = client
+            .stream_prompt(Some("Be concise."), "hi stream", CancellationToken::new())
+            .await
+            .expect("mock stream_prompt should succeed")
+            .map(|r| r.expect("chunk ok"))
+            .collect()
+            .await;
+        assert_eq!(
+            chunks,
+            vec![
+                StreamChunk::Token("Hello ".to_string()),
+                StreamChunk::Token("stream!".to_string()),
+                StreamChunk::Done,
+            ]
+        );
+
+        let _ = provider.force_flush();
+        let spans = exporter.get_finished_spans().unwrap();
+        let genai_spans: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name.as_ref() == "gen_ai.chat")
+            .collect();
+        assert_eq!(
+            genai_spans.len(),
+            2,
+            "expected chat and stream gen_ai.chat spans"
+        );
+
+        let find_attr = |span: &opentelemetry_sdk::trace::SpanData, key: &str| {
+            span.attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.clone())
+        };
+
+        let chat_span = genai_spans
+            .iter()
+            .find(|s| find_attr(s, GEN_AI_OPERATION_NAME) == Some(Value::String("chat".into())))
+            .expect("chat span");
+        assert_eq!(
+            find_attr(chat_span, GEN_AI_SYSTEM),
+            Some(Value::String("rig-core".into()))
+        );
+        assert_eq!(
+            find_attr(chat_span, GEN_AI_REQUEST_MODEL),
+            Some(Value::String("gpt-4o-mini".into()))
+        );
+        assert_eq!(
+            find_attr(chat_span, GEN_AI_PROVIDER_NAME),
+            Some(Value::String("openai".into()))
+        );
+        assert_eq!(
+            find_attr(chat_span, GEN_AI_RESPONSE_COMPLETION_TOKENS),
+            Some(Value::I64(4))
+        );
+        assert!(
+            find_attr(chat_span, GEN_AI_SERVER_TTFT_US).is_none(),
+            "non-streaming chat must not record TTFT"
+        );
+
+        let stream_span = genai_spans
+            .iter()
+            .find(|s| find_attr(s, GEN_AI_OPERATION_NAME) == Some(Value::String("stream".into())))
+            .expect("stream span");
+        assert_eq!(
+            find_attr(stream_span, GEN_AI_SYSTEM),
+            Some(Value::String("rig-core".into()))
+        );
+        assert_eq!(
+            find_attr(stream_span, GEN_AI_REQUEST_MODEL),
+            Some(Value::String("gpt-4o-mini".into()))
+        );
+        assert_eq!(
+            find_attr(stream_span, GEN_AI_RESPONSE_COMPLETION_TOKENS),
+            Some(Value::I64(2))
+        );
+        assert!(
+            find_attr(stream_span, GEN_AI_SERVER_TTFT_US).is_some(),
+            "streaming call must record TTFT"
+        );
+
+        let _ = provider.shutdown();
+        server_handle.abort();
     }
 }

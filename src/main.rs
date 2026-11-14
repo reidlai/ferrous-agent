@@ -11,9 +11,9 @@ use ferrous_agent::benchmark::{
     BenchmarkSuite, DryRunDispatch, DEFAULT_DELTA_DIR,
 };
 use ferrous_agent::config::AgentConfig;
+use ferrous_agent::telemetry;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -65,21 +65,28 @@ struct BenchmarkArgs {
     sse_bind: Option<SocketAddr>,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+fn main() -> ExitCode {
+    let _telemetry_guard = telemetry::init_telemetry();
 
     let cli = Cli::parse();
 
-    match cli.command {
-        Some(Commands::Benchmark(args)) => run_benchmark_cli(args).await,
-        None => run_agent_init(cli.check_config),
-    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            eprintln!("Failed to initialize Tokio runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    runtime.block_on(async move {
+        match cli.command {
+            Some(Commands::Benchmark(args)) => run_benchmark_cli(args).await,
+            None => run_agent_init(cli.check_config),
+        }
+    })
 }
 
 fn run_agent_init(check_config_only: bool) -> ExitCode {

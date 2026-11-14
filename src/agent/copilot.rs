@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use rig_core::completion::ToolDefinition;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::agent::provider::{CompletionDispatch, LlmClient};
 use crate::agent::streaming::BoxedChunkStream;
@@ -121,10 +122,16 @@ impl CopilotAgent {
         prompt: &str,
         cancel: CancellationToken,
     ) -> Result<String, AgentError> {
+        let span = tracing::info_span!(
+            "copilot.turn",
+            provider = %self.provider(),
+            model = self.model_name()
+        );
         let (sanitized_prompt, de_anonymizer) = self.sanitizer.sanitize_for_llm(prompt)?;
         let reply = if self.tools.is_empty() {
             self.dispatch
                 .prompt(self.preamble.as_deref(), &sanitized_prompt, cancel)
+                .instrument(span)
                 .await?
         } else {
             self.dispatch
@@ -134,6 +141,7 @@ impl CopilotAgent {
                     &self.tools,
                     cancel,
                 )
+                .instrument(span)
                 .await?
         };
         Ok(de_anonymizer.restore(&reply))
@@ -145,9 +153,15 @@ impl CopilotAgent {
         prompt: &str,
         cancel: CancellationToken,
     ) -> Result<BoxedChunkStream, AgentError> {
+        let span = tracing::info_span!(
+            "copilot.turn",
+            provider = %self.provider(),
+            model = self.model_name()
+        );
         let (sanitized_prompt, _de_anonymizer) = self.sanitizer.sanitize_for_llm(prompt)?;
         self.dispatch
             .stream_prompt(self.preamble.as_deref(), &sanitized_prompt, cancel)
+            .instrument(span)
             .await
     }
 }
