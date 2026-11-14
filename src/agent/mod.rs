@@ -32,6 +32,10 @@ pub enum AgentError {
     /// Stream adaptation or cancellation error.
     #[error("stream error: {0}")]
     Stream(String),
+
+    /// Inbound prompt blocked by the `context-sanitizer` ingress firewall.
+    #[error("prompt blocked by ingress firewall: {0}")]
+    IngressBlocked(#[from] crate::sanitizer::IngressAlert),
 }
 
 impl From<rig_core::error::ProviderError> for AgentError {
