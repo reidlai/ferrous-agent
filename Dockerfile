@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM --platform=linux/amd64 rust:1.88-alpine AS builder
+FROM --platform=linux/amd64 rust:1.99-alpine AS builder
 
 # hadolint ignore=DL3018
 RUN apk add --no-cache musl-dev ca-certificates binutils \
