@@ -2,6 +2,7 @@ pub mod agent;
 pub mod benchmark;
 pub mod client;
 pub mod config;
+pub mod mcp;
 pub mod models;
 pub mod sanitizer;
 pub mod server;
